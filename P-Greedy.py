@@ -13,11 +13,11 @@ import numpy as np
 # node_dict schema: {node_id: (time_series: np.ndarray, value: float, extra_info: dict)}
 NodeDict = Dict[Hashable, Tuple[np.ndarray, float, Dict[str, Any]]]
 
-A_NONLINEAR: float = 0.9
+NONLINEAR: float = 0.9
 EPS: float = 1e-12
 
 
-def sim_fds(ts1: np.ndarray, ts2: np.ndarray, a: float = A_NONLINEAR) -> float:
+def sim_fds(ts1: np.ndarray, ts2: np.ndarray, a: float = NONLINEAR) -> float:
     """
     Frequency-Domain Similarity (FDS) with a monotonic mapping to [-1, 1].
 

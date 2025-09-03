@@ -7,19 +7,39 @@ Created on Wed Sep  3 17:50:55 2025
 
 import networkx as nx
 import numpy as np
+import heapq
 from typing import Dict, Hashable, List, Optional, Set, Tuple
 
 
-def sim(ts1, ts2, a: float = 0.9):
+# node_dict: {node_id: (time_series: np.ndarray, value: float, other_info: dict)}
+NodeDict = Dict[Hashable, Tuple[np.ndarray, float, Dict[str, Any]]]
+
+# Nonlinear parameter for similarity mapping
+NONLINEAR: float = 0.9
+
+
+def _sim_fds(ts1: np.ndarray, ts2: np.ndarray, a: float = NONLINEAR) -> float:
+    """
+    Frequency-Domain Similarity (FDS) + monotonic mapping, returns a score in [-1, 1].
+
+    Steps:
+      1) Mean-center both time series
+      2) Take FFT magnitudes (first half spectrum)
+      3) L2 normalize and compute cosine similarity
+      4) Apply nonlinear mapping: (s - a) / (1 - a*s)
+    """
     f = np.asarray(ts1, dtype=np.float64) - float(np.mean(ts1))
     g = np.asarray(ts2, dtype=np.float64) - float(np.mean(ts2))
+
     F = np.abs(np.fft.fft(f))[: len(f) // 2]
     G = np.abs(np.fft.fft(g))[: len(g) // 2]
+
     nF, nG = np.linalg.norm(F), np.linalg.norm(G)
     if nF == 0.0 or nG == 0.0:
         return 0.0
-    s = float(np.dot(F / nF, G / nG))
-    return (s - a) / (1.0 - a * s)
+
+    s = float(np.dot(F / nF, G / nG))  # in [-1, 1]
+    return float((s - a) / (1.0 - a * s))
 
 
 def expand_subgraph_hybrid_oss(G, node_dict, node_x):
@@ -137,3 +157,112 @@ def expand_subgraph_hybrid_oss(G, node_dict, node_x):
     current_subgraph_nodes = reconstruct(node_x, best_key)
     current_g_value = best_score
     return current_subgraph_nodes, current_g_value
+
+def find_k_best_subgraphs_lazy(
+    G: nx.DiGraph,
+    node_dict: NodeDict,
+    k: int,
+) -> Tuple[List[Tuple[Set[Hashable], float]], float]:
+    """
+    Select up to k non-overlapping subgraphs using a LAZY max-heap over seeds.
+
+    Core ideas:
+      - Work on a mutable copy G_unused.
+      - Maintain a cache: seed -> (sub_nodes, g_value).
+      - Maintain a version counter per seed for lazy invalidation.
+      - Use a max-heap of entries (-g_value, str(seed), version) to always pop
+        the current best. Discard heap entries if they are stale (version mismatch),
+        disappeared from the graph, or no longer in node_dict.
+
+      - After selecting a subgraph:
+          * Compute union of its ancestors in G_unused (BEFORE removal),
+            and mark these seeds as "affected" → recompute and push fresh entries.
+          * Remove selected nodes from G_unused to enforce disjointness.
+          * Drop cache entries for seeds that disappeared.
+
+      - Early stop if the current best g ≤ 0.
+
+    Returns:
+        (subgraphs, total_g),
+        where subgraphs = [({nodes}, g_value), ...] in selection order.
+    """
+    if k <= 0:
+        return [], 0.0
+
+    results: List[Tuple[Set[Hashable], float]] = []
+    total_g = 0.0
+
+    G_unused = G.copy()
+    cache: Dict[Hashable, Tuple[Set[Hashable], float]] = {}     # seed -> (nodes, g)
+    version: Dict[Hashable, int] = {}                           # seed -> int
+    heap: List[Tuple[float, str, int, Hashable]] = []           # (-g, str(seed), ver, seed)
+
+    def recompute_seed(seed: Hashable) -> None:
+        """Recompute (sub_nodes, g) for `seed` on current G_unused and push to heap."""
+        if (seed not in node_dict) or (not G_unused.has_node(seed)):
+            return
+        sub_nodes, g_value = expand_subgraph_pgreedy_tree(G_unused, node_dict, seed)
+        cache[seed] = (sub_nodes, g_value)
+        version[seed] = version.get(seed, 0) + 1
+        heapq.heappush(heap, (-float(g_value), str(seed), version[seed], seed))
+
+    # Initialize: compute once for all valid seeds (lazy heap mainly saves re-scans across rounds)
+    for seed in list(G_unused.nodes):
+        if seed in node_dict:
+            recompute_seed(seed)
+
+    rounds = 0
+    while heap and rounds < k:
+        # Pop until a valid top is found
+        while heap:
+            neg_g, seed_str, ver, seed = heap[0]
+            # Validate seed presence and version
+            if (seed not in node_dict) or (not G_unused.has_node(seed)) or (version.get(seed, -1) != ver):
+                heapq.heappop(heap)  # stale entry
+                continue
+            # Pull current cached value
+            sub_nodes, g_value = cache.get(seed, (set(), float("-inf")))
+            # If cached vanished or seed not present anymore, discard
+            if not sub_nodes and g_value == float("-inf"):
+                heapq.heappop(heap)
+                continue
+            break
+
+        if not heap:
+            break
+
+        # Peek is valid; check the best
+        neg_g, seed_str, ver, seed = heapq.heappop(heap)
+        sub_nodes, g_value = cache[seed]
+
+        if g_value <= 0.0 + EPS:
+            break  # early stop
+
+        # Accept this subgraph
+        results.append((sub_nodes, float(g_value)))
+        total_g += float(g_value)
+        rounds += 1
+
+        # Gather ancestors BEFORE removal (relative to current G_unused)
+        affected_ancestors: Set[Hashable] = set()
+        for n in sub_nodes:
+            if G_unused.has_node(n):
+                affected_ancestors |= nx.ancestors(G_unused, n)
+
+        # Remove selected nodes (enforce non-overlap)
+        G_unused.remove_nodes_from(sub_nodes)
+
+        # Invalidate cache entries that disappeared; keep others
+        for s in list(cache.keys()):
+            if (s in sub_nodes) or (not G_unused.has_node(s)):
+                cache.pop(s, None)
+                version.pop(s, None)  # drop version; any heap entries for it will be treated stale
+
+        # Recompute affected seeds that still exist
+        for s in sorted(affected_ancestors, key=lambda x: str(x)):
+            if G_unused.has_node(s) and s in node_dict:
+                recompute_seed(s)
+
+        # Also, some seeds may still be in heap with old versions; they will be lazily discarded.
+
+    return results, float(total_g)

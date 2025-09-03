@@ -13,10 +13,10 @@ import numpy as np
 NodeDict = Dict[Hashable, Tuple[np.ndarray, float, Dict[str, Any]]]
 
 # Nonlinear parameter for similarity mapping
-A_NONLINEAR: float = 0.9
+NONLINEAR: float = 0.9
 
 
-def _sim_fds(ts1: np.ndarray, ts2: np.ndarray, a: float = A_NONLINEAR) -> float:
+def _sim_fds(ts1: np.ndarray, ts2: np.ndarray, a: float = NONLINEAR) -> float:
     """
     Frequency-Domain Similarity (FDS) + monotonic mapping, returns a score in [-1, 1].
 
